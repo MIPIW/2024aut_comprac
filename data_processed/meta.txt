@@ -1,3 +1,0 @@
-samsungsdi_5mins.csv
-samsungsds_5mins.csv
-samsungmulsan_5min.csv
