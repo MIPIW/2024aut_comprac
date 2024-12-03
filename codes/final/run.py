@@ -300,8 +300,8 @@ def set_normal_trainer(args, datasets, model, tokenizer):
 
     trainingarguments = TrainingArguments(
         do_train = True,    
-        output_dir = od,                         
-        evaluation_strategy = "epoch", # necessary: change to step
+        output_dir = od,     
+        save_strategy = "epoch",                    
         logging_strategy = "epoch",
         save_total_limit = 1,
         greater_is_better = True, # necessary: higher metric results better performance # default = True when metric_for_best_model is set
@@ -520,7 +520,7 @@ def main(args):
     if args.DDP:
         model.to(args.local_rank)
         model = dist(model, device_ids=[args.local_rank])
-        
+
 
     print("set trainer")
     ppoModel, ppoTokenizer = model, tokenizer
