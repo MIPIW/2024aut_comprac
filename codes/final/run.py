@@ -145,7 +145,7 @@ def set_dpo_dataset(data):
     for example in data:
         rejected_exmample = []
         for dataIdx in range(len(example)):
-            x = int(round(random.randint(100, 1000), -2))
+            x = int(round(random.randint(10000, 100000), -4))
             rejected_exmample.append(min(example[dataIdx] + x, 200000))
         rejected_data.append(rejected_exmample)
 
@@ -338,6 +338,7 @@ def set_normal_trainer(args, datasets, model, tokenizer):
 def set_smoothing_probs(args):
     # labels
     # 
+    pass
 
 def set_smoothing_CE_trainer(args, datasets, model, tokenizer):
         
