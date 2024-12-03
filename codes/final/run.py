@@ -484,7 +484,6 @@ def calculate_gap(args, decoded_outputs, gold_value):
 #############################################################################################
 #########################################main################################################
 
-
 @TimeUtils.consumedTime_decorator # the arguments should only be a single namespace object
 def main(args):
     
@@ -514,22 +513,40 @@ def main(args):
     config = make_config(args, tokenizer)
     model = GPT2LMHeadModel(config)
     print(format(sum(p.numel() for p in model.parameters() if p.requires_grad), ",d"))
+    ppoTokenizer = tokenizer
+    pplModel_100 = GPT2LMHeadModel(config)
+    pplModel_1000 = GPT2LMHeadModel(config)
+    pplModel_10000 = GPT2LMHeadModel(config)
+
+    print("set trainer")
 
     if args.DP:
         model = DataParallel(model)
+        pplModel_100 = DataParallel(pplModel_100)
+        pplModel_1000 = DataParallel(pplModel_1000)
+        pplModel_10000 = DataParallel(pplModel_10000)
+
     if args.DDP:
         model.to(args.local_rank)
+        pplModel_100.to(args.local_rank)
+        pplModel_1000.to(args.local_rank)
+        pplModel_10000.to(args.local_rank)
+
         model = dist(model, device_ids=[args.local_rank])
+        pplModel_100 = dist(pplModel_100, device_ids=[args.local_rank])
+        pplModel_1000 = dist(pplModel_1000, device_ids=[args.local_rank])
+        pplModel_10000 = dist(pplModel_10000, device_ids=[args.local_rank])
 
-
-    print("set trainer")
-    ppoModel, ppoTokenizer = model, tokenizer
     
     normalTrainer = set_normal_trainer(args, dataset_normal, model, tokenizer)
-    ppoTrainer = set_ppo_trainer(args, dataset_rand100, ppoModel, ppoTokenizer, "100")
+    ppoTrainer_100 = set_ppo_trainer(args, dataset_rand100, pplModel_100, ppoTokenizer, "100")
+    ppoTrainer_1000 = set_ppo_trainer(args, dataset_rand1000, pplModel_1000, ppoTokenizer, "100")
+    ppoTrainer_10000 = set_ppo_trainer(args, dataset_rand10000, pplModel_10000, ppoTokenizer, "100")
     
-    ppoTrainer.train()
     normalTrainer.train()
+    ppoTrainer_100.train()
+    ppoTrainer_1000.train()
+    ppoTrainer_10000.train()
 
     
 
