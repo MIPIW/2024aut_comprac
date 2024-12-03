@@ -8,7 +8,8 @@ import pandas as pd
 import pickle
 import re, json
 from datasets import Dataset
-from transformers import AutoModelForCausalLM, Trainer, TrainingArguments, DataCollatorForLanguageModeling, GPT2LMHeadModel
+from transformers import AutoConfig, GPT2LMHeadModel
+from transformers import AutoModelForCausalLM, Trainer, TrainingArguments, DataCollatorForLanguageModeling
 from datasets import load_dataset
 from transformers import AutoTokenizer, pipeline, AutoModelForSequenceClassification, TrainingArguments
 from trl import AutoModelForCausalLMWithValueHead, PPOConfig, PPOTrainer, RewardTrainer, RewardConfig, get_peft_config, SFTConfig
@@ -26,6 +27,8 @@ import math
 sys.path.append(os.path.expanduser('~/'))
 from myUtils.timeUtils import TimeUtils
 from myUtils.IOUtils import IOUtils
+sys.path.append(os.path.expanduser('~/2024aut_comprac/'))
+
 from KoreanNumber import num2kr
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -185,18 +188,21 @@ def set_normal_dataset(data):
 #############################################################################################
 #####################################prepare model###########################################
 
-
-
-def set_normal_model(args):
-
-    model = GPT2LMHeadModel.from_pretrained(args.checkpoint, device_map = "auto")
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_joint, padding_side = "left")    
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"
-    tokenizer.truncation_side = "left"
-    model.resize_token_embeddings(len(tokenizer))
+def make_config(args, tokenizer):
     
-    return model, tokenizer
+    config = AutoConfig.from_pretrained(
+        args.ggangtong_model_checkpoint,
+        vocab_size = len(tokenizer),
+        n_ctx = 1024,
+        bos_token_id = tokenizer.bos_token_id,
+        eos_token_id = tokenizer.eos_token_id,
+        n_embd = 512,
+        n_head = 8,
+        n_layer = 8,
+        n_positions = 1024, 
+    )
+
+    return config
 
 
 #############################################################################################
@@ -206,9 +212,9 @@ def set_normal_model(args):
 
 
 # def set_ppo_trainer(args, dataset, model, tokenizer, config):
-def set_ppo_trainer(args, datasets, model, tokenizer):
+def set_ppo_trainer(args, datasets, model, tokenizer, randRange):
 
-    od = args.output_rlhf_checkpoint + os.sep + datetime.strftime(datetime.now(), "%m-%d-%H-%M-%S")
+    od = args.output_final +f"_{randRange}" + os.sep + datetime.strftime(datetime.now(), "%m-%d-%H-%M-%S")
     try: os.mkdir(od)
     except: pass
 
@@ -217,17 +223,12 @@ def set_ppo_trainer(args, datasets, model, tokenizer):
         num_train_epochs=10,                     # number of training epochs
         per_device_train_batch_size=512,         # batch size per device during training
         per_device_eval_batch_size=512,           # batch size for evaluation
-        gradient_accumulation_steps=1,          # number of steps before performing a backward/update pass
-        gradient_checkpointing=True,            # use gradient checkpointing to save memory
-        optim="adamw_torch_fused",              # use fused adamw optimizer
+        optim="adamw_torch",              # use fused adamw optimizer
         learning_rate=1e-7,                     # 10x higher LR than QLoRA paper
-        max_grad_norm=0.3,                      # max gradient norm based on QLoRA paper
         lr_scheduler_type="cosine",             # use cosine learning rate scheduler
-        logging_steps=25,                       # log every 25 steps
-        eval_steps = 20, # necessary: set step
-        save_steps = 20,                        # when to save checkpoint
-        save_total_limit=2,                     # limit the total amount of checkpoints
-        evaluation_strategy="steps",            # evaluate every 1000 steps
+        save_total_limit=1,                     # limit the total amount of checkpoints
+        save_strategy="epoch",            # evaluate every 1000 steps
+        logging_strategy = "epoch",
         bf16=True,                              # use bfloat16 precision
         tf32=False,                              # use tf32 precision
         push_to_hub=False,                      # push model to hub
@@ -293,20 +294,16 @@ def set_normal_trainer(args, datasets, model, tokenizer):
     # train_dataset = train_dataset.map(tokenize, batched = False)
     # valid_dataset = valid_dataset.map(tokenize, batched = False)    
 
-    od = args.output_normal_checkpoint + os.sep + datetime.strftime(datetime.now(), "%m-%d-%H-%M-%S")
+    od = args.output_final + f"_normal" + os.sep + datetime.strftime(datetime.now(), "%m-%d-%H-%M-%S")
     try: os.mkdir(od)
     except: pass
 
     trainingarguments = TrainingArguments(
         do_train = True,    
         output_dir = od,                         
-        evaluation_strategy = "steps", # necessary: change to step
-        save_strategy = "steps",                         
-        eval_steps = 20, # necessary: set step
-        save_steps = 20,
-        save_total_limit = 2,
-        load_best_model_at_end = True, # necessary: EarlyStoppingCallBack하려면 True여야 함
-        metric_for_best_model = "accuracy",
+        evaluation_strategy = "epoch", # necessary: change to step
+        logging_strategy = "epoch",
+        save_total_limit = 1,
         greater_is_better = True, # necessary: higher metric results better performance # default = True when metric_for_best_model is set
         num_train_epochs = 10,
         seed = 42,
@@ -314,6 +311,8 @@ def set_normal_trainer(args, datasets, model, tokenizer):
         per_device_eval_batch_size = 512,
         # eval_accumulation_steps = 50,
         learning_rate = 1e-7,
+        bf16=True,                              # use bfloat16 precision
+        tf32=False,                              # use tf32 precision
         remove_unused_columns = False
     )
 
@@ -327,7 +326,6 @@ def set_normal_trainer(args, datasets, model, tokenizer):
         args = trainingarguments,
         tokenizer = tokenizer,
         train_dataset = train_dataset,
-        eval_dataset = valid_dataset,
         data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
         compute_metrics = partial(metric, func = accuracy)
     )
@@ -480,6 +478,7 @@ def calculate_gap(args, decoded_outputs, gold_value):
     return sum(res) / len(res)
 
 
+
 #############################################################################################
 #############################################################################################
 #############################################################################################
@@ -489,34 +488,45 @@ def calculate_gap(args, decoded_outputs, gold_value):
 @TimeUtils.consumedTime_decorator # the arguments should only be a single namespace object
 def main(args):
     
-    random.seed(42)
-    data = preprocess(args)
-    print(len(data))
-    random.shuffle(data)
+    print("loading normal dataset")
+    with open(args.dataset_normal, "rb") as f:
+        dataset_normal = pickle.load(f)
+    
+    print("loading rand100 dataset")
+    with open(args.dataset_rand100, "rb") as f:
+        dataset_rand100 = pickle.load(f)
+    
+    print("loading rand1000 dataset")
+    with open(args.dataset_rand1000, "rb") as f:
+        dataset_rand1000 = pickle.load(f)
+    
+    print("loading rand10000 dataset")
+    with open(args.dataset_rand10000, "rb") as f:
+        dataset_rand10000 = pickle.load(f)
+    
+    print("prepare models")
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_joint)
+    tokenizer.add_special_tokens({"pad_token": "<pad>"}) # Llama3 doesn't have pad_token
+    tokenizer.bos_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+    tokenizer.truncation_side = "left"
 
-    dist = get_distribution(data)
-    x = _num_to_str(data[1234])
-    decode_sample = _str_to_num(x)
+    config = make_config(args, tokenizer)
+    model = GPT2LMHeadModel(config)
+    print(format(sum(p.numel() for p in model.parameters() if p.requires_grad), ",d"))
+
+    if args.DP:
+        model = DataParallel(model)
+    if args.DDP:
+        model.to(args.local_rank)
+        model = dist(model, device_ids=[args.local_rank])
+        
+
+    print("set trainer")
+    ppoModel, ppoTokenizer = model, tokenizer
     
-    # we don't need reward model in DPO
-    dataset_dpo_train, dataset_dpo_valid, dataset_dpo_test = set_dpo_dataset(data)
-    dataset_dpo = {
-        "train": dataset_dpo_train,
-        "valid": dataset_dpo_valid,
-        "test": dataset_dpo_test
-    }
-    dataset_normal_train, dataset_normal_valid, dataset_normal_test = set_normal_dataset(data)
-    dataset_normal = {
-        'train': dataset_normal_train, 
-        "valid": dataset_normal_valid,
-        "test": dataset_normal_test
-    }
-    
-    normalModel, normalTokenizer = set_normal_model(args)
-    ppoModel, ppoTokenizer = normalModel, normalTokenizer
-    
-    normalTrainer = set_normal_trainer(args, dataset_normal, normalModel, normalTokenizer)
-    ppoTrainer = set_ppo_trainer(args, dataset_dpo, ppoModel, ppoTokenizer)
+    normalTrainer = set_normal_trainer(args, dataset_normal, model, tokenizer)
+    ppoTrainer = set_ppo_trainer(args, dataset_rand100, ppoModel, ppoTokenizer, "100")
     
     ppoTrainer.train()
     normalTrainer.train()
@@ -544,29 +554,50 @@ def main(args):
 
 
 if __name__ == "__main__":
-    dir_files = "/home/hyohyeongjang/2024aut_comprac/data/data_rlhf"
-    name_processed_files = "/home/hyohyeongjang/2024aut_comprac/data/data_rlhf_processed/data_rlhf.pk"
-    columns_need = ['일자', '종가']
-    checkpoint = "/home/hyohyeongjang/2024aut_comprac/weights/model_joint/10-15-02-51-17/checkpoint-50"
-    tokenizer_joint = "/home/hyohyeongjang/2024aut_comprac/tokenizers/tokenizer_joint_jaeyoon"
-    reward_model_checkpoint = "distilroberta-base"
-    # already trained
-    output_reward_checkpoint = "/home/hyohyeongjang/2024aut_comprac/weights/reward_model/checkpoint-936"
-    output_rlhf_checkpoint = "/home/hyohyeongjang/2024aut_comprac/weights/rlhf_result"
-    output_normal_checkpoint = "/home/hyohyeongjang/2024aut_comprac/weights/no_rlhf_result"
-    num_cores = 4
+    
+    DDP = False
+    DP = False
+    global_rank = '0'
+    if DP or DDP:
+        os.environ["CUDA_VISIBLE_DEVICES"] = global_rank
+    else:
+        os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+
+    if DDP:
+        import torch.distributed as dist
+        dist.init_process_group("nccl")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+    else:
+        local_rank = None
+
+    if DP:
+        from torch.nn import DataParallel
 
     args = Namespace(
-        dir_files = dir_files,
-        name_processed_files = name_processed_files,
-        columns_need = columns_need,
-        checkpoint = checkpoint,
-        tokenizer_joint = tokenizer_joint,
-        reward_checkpoint = reward_model_checkpoint,
-        output_reward_checkpoint = output_reward_checkpoint,
-        output_rlhf_checkpoint = output_rlhf_checkpoint,
-        output_normal_checkpoint = output_normal_checkpoint,
-        num_cores = num_cores,
+        
+        ggangtong_model_checkpoint = "openai-community/gpt2",  
+
+        # dir_files = "/home/hyohyeongjang/2024aut_comprac/data/data_rlhf"
+        # name_processed_files = "/home/hyohyeongjang/2024aut_comprac/data/data_rlhf_processed/data_rlhf.pk"
+        # columns_need = ['일자', '종가']
+        # checkpoint = "/home/hyohyeongjang/2024aut_comprac/weights/model_joint/10-15-02-51-17/checkpoint-50"
+        tokenizer_joint = "/home/hyohyeongjang/2024aut_comprac/tokenizers/tokenizer_joint_jaeyoon",
+        # reward_model_checkpoint = "distilroberta-base"
+        
+        output_reward_checkpoint = "/home/hyohyeongjang/2024aut_comprac/weights/reward_model/checkpoint-936",
+        output_final = "/home/hyohyeongjang/2024aut_comprac/weights/final_result",
+        num_cores = 4,
+
+        dataset_normal = "/home/hyohyeongjang/2024aut_comprac/data/data_final/data-normal.pk",
+        dataset_rand100 = "/home/hyohyeongjang/2024aut_comprac/data/data_final/data-reward-rand100.pk",
+        dataset_rand1000 = "/home/hyohyeongjang/2024aut_comprac/data/data_final/data-reward-rand1000.pk",
+        dataset_rand10000 = "/home/hyohyeongjang/2024aut_comprac/data/data_final/data-reward-rand10000.pk",
+
     )
+
+    args.local_rank = local_rank
+    args.DP = DP
+    args.DDP = DDP
 
     main(args)
