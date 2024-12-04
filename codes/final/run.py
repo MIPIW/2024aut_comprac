@@ -1,13 +1,12 @@
 import os, sys
-from openpyxl import load_workbook
 import pandas as pd, numpy as np
 from argparse import Namespace
-from datetime import datetime
 import evaluate
+from datetime import datetime
 import pandas as pd
 import pickle
 import re, json
-from datasets import Dataset
+from datasets import Dataset, DatasetDict
 from transformers import AutoConfig, GPT2LMHeadModel
 from transformers import AutoModelForCausalLM, Trainer, TrainingArguments, DataCollatorForLanguageModeling
 from datasets import load_dataset
@@ -18,18 +17,16 @@ from trl.trainer.ppov2_trainer import PPOv2Trainer
 from tqdm import tqdm
 import transformers
 import torch
-from peft import LoraConfig, TaskType
 import random
 from functools import partial
 import math
+from knockknock import slack_sender
+
 
 # Add the ~/myUtil directory to sys.path
-sys.path.append(os.path.expanduser('~/'))
-from myUtils.timeUtils import TimeUtils
-from myUtils.IOUtils import IOUtils
 sys.path.append(os.path.expanduser('~/2024aut_comprac/'))
 
-from KoreanNumber import num2kr
+# from KoreanNumber import num2kr
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -221,13 +218,15 @@ def set_ppo_trainer(args, datasets, model, tokenizer, randRange):
     dpoConfig = DPOConfig(
         output_dir=od,               # directory to save and repository id
         num_train_epochs=10,                     # number of training epochs
-        per_device_train_batch_size=512,         # batch size per device during training
-        per_device_eval_batch_size=512,           # batch size for evaluation
+        per_device_train_batch_size=64,         # batch size per device during training
+        per_device_eval_batch_size=64,           # batch size for evaluation
         optim="adamw_torch",              # use fused adamw optimizer
+        metric_for_best_model = "loss",
         learning_rate=1e-7,                     # 10x higher LR than QLoRA paper
         lr_scheduler_type="cosine",             # use cosine learning rate scheduler
         save_total_limit=1,                     # limit the total amount of checkpoints
         save_strategy="epoch",            # evaluate every 1000 steps
+        eval_strategy="epoch",
         logging_strategy = "epoch",
         bf16=True,                              # use bfloat16 precision
         tf32=False,                              # use tf32 precision
@@ -248,14 +247,14 @@ def set_ppo_trainer(args, datasets, model, tokenizer, randRange):
     }
 
     trainer = DPOTrainer(
-        model,
+        model.module if args.DP or args.DDP else model,
         ref_model=None, # set to none since we use peft
         args=dpoConfig,
         train_dataset=train_dataset,
         eval_dataset=valid_dataset,
         tokenizer=tokenizer,
         max_length=512,
-        max_prompt_length=64,
+        max_prompt_length=2,
         beta=dpo_args["beta"],
         loss_type=dpo_args["loss_type"],
     )
@@ -280,8 +279,8 @@ def set_normal_trainer(args, datasets, model, tokenizer):
         kwargs = {"padding": "max_length", "truncation": True, "max_length": 512, "return_tensors": "pt"}
         return tokenizer(examples['text'], **kwargs)
 
-    train_dataset = datasets['train'].map(tokenize_func, batched=True, num_proc = 4)
-    valid_dataset = datasets['valid'].map(tokenize_func, batched=True, num_proc = 4)
+    train_dataset = datasets['train'].map(tokenize_func, batched=True, num_proc = args.num_cores)
+    valid_dataset = datasets['valid'].map(tokenize_func, batched=True, num_proc = args.num_cores)
     train_dataset = train_dataset.remove_columns("text")
     valid_dataset = valid_dataset.remove_columns("text")
 
@@ -301,15 +300,18 @@ def set_normal_trainer(args, datasets, model, tokenizer):
     trainingarguments = TrainingArguments(
         do_train = True,    
         output_dir = od,     
+        metric_for_best_model = "loss",
+        eval_strategy="epoch",
         save_strategy = "epoch",                    
         logging_strategy = "epoch",
         save_total_limit = 1,
         greater_is_better = True, # necessary: higher metric results better performance # default = True when metric_for_best_model is set
         num_train_epochs = 10,
         seed = 42,
-        per_device_train_batch_size = 512,
-        per_device_eval_batch_size = 512,
+        per_device_train_batch_size = 64,
+        per_device_eval_batch_size = 64,
         # eval_accumulation_steps = 50,
+        lr_scheduler_type="cosine",             # use cosine learning rate scheduler
         learning_rate = 1e-7,
         bf16=True,                              # use bfloat16 precision
         tf32=False,                              # use tf32 precision
@@ -322,10 +324,11 @@ def set_normal_trainer(args, datasets, model, tokenizer):
     
 
     trainer = Trainer(
-        model = model,
+        model = model.module if args.DP or args.DDP else model,
         args = trainingarguments,
         tokenizer = tokenizer,
         train_dataset = train_dataset,
+        eval_dataset = valid_dataset,
         data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
         compute_metrics = partial(metric, func = accuracy)
     )
@@ -385,8 +388,8 @@ def set_smoothing_CE_trainer(args, datasets, model, tokenizer):
         greater_is_better = True, # necessary: higher metric results better performance # default = True when metric_for_best_model is set
         num_train_epochs = 10,
         seed = 42,
-        per_device_train_batch_size = 512,
-        per_device_eval_batch_size = 512,
+        per_device_train_batch_size = 16,
+        per_device_eval_batch_size = 16,
         # eval_accumulation_steps = 50,
         learning_rate = 1e-7,
         remove_unused_columns = False
@@ -413,7 +416,7 @@ def set_smoothing_CE_trainer(args, datasets, model, tokenizer):
             return (mse_loss, outputs) if return_outputs else mse_loss
 
     trainer = SmoothingCETrainer(
-        model = model,
+        model = model.module if args.DP or args.DDP else model,
         args = trainingarguments,
         tokenizer = tokenizer,
         train_dataset = train_dataset,
@@ -484,14 +487,14 @@ def calculate_gap(args, decoded_outputs, gold_value):
 #############################################################################################
 #########################################main################################################
 
-@TimeUtils.consumedTime_decorator # the arguments should only be a single namespace object
+webhook_url = "https://hooks.slack.com/services/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"
+@slack_sender(webhook_url=webhook_url, channel="mine")
 def main(args):
     
     print("loading normal dataset")
     with open(args.dataset_normal, "rb") as f:
         dataset_normal = pickle.load(f)
     
-    print("loading rand100 dataset")
     with open(args.dataset_rand100, "rb") as f:
         dataset_rand100 = pickle.load(f)
     
@@ -518,26 +521,26 @@ def main(args):
     pplModel_1000 = GPT2LMHeadModel(config)
     pplModel_10000 = GPT2LMHeadModel(config)
 
-    print("set trainer")
-
     if args.DP:
+        print("set DP settings")
         model = DataParallel(model)
         pplModel_100 = DataParallel(pplModel_100)
         pplModel_1000 = DataParallel(pplModel_1000)
         pplModel_10000 = DataParallel(pplModel_10000)
 
     if args.DDP:
+        print("set DDP settings")
         model.to(args.local_rank)
         pplModel_100.to(args.local_rank)
         pplModel_1000.to(args.local_rank)
         pplModel_10000.to(args.local_rank)
+        
+        model = DDP(model, device_ids=[args.local_rank])
+        pplModel_100 = DDP(pplModel_100, device_ids=[args.local_rank])
+        pplModel_1000 = DDP(pplModel_1000, device_ids=[args.local_rank])
+        pplModel_10000 = DDP(pplModel_10000, device_ids=[args.local_rank])
 
-        model = dist(model, device_ids=[args.local_rank])
-        pplModel_100 = dist(pplModel_100, device_ids=[args.local_rank])
-        pplModel_1000 = dist(pplModel_1000, device_ids=[args.local_rank])
-        pplModel_10000 = dist(pplModel_10000, device_ids=[args.local_rank])
-
-    
+    print("set trainer and trainingDatasets")
     normalTrainer = set_normal_trainer(args, dataset_normal, model, tokenizer)
     ppoTrainer_100 = set_ppo_trainer(args, dataset_rand100, pplModel_100, ppoTokenizer, "100")
     ppoTrainer_1000 = set_ppo_trainer(args, dataset_rand1000, pplModel_1000, ppoTokenizer, "100")
@@ -572,15 +575,16 @@ def main(args):
 
 if __name__ == "__main__":
     
-    DDP = False
+    DDP = True
     DP = False
-    global_rank = '0'
     if DP or DDP:
+        global_rank = '0,1,2,3,4'
         os.environ["CUDA_VISIBLE_DEVICES"] = global_rank
     else:
         os.environ["CUDA_VISIBLE_DEVICES"] = '0'
 
     if DDP:
+        from torch.nn.parallel import DistributedDataParallel as DDP
         import torch.distributed as dist
         dist.init_process_group("nccl")
         local_rank = int(os.environ["LOCAL_RANK"])
@@ -604,7 +608,7 @@ if __name__ == "__main__":
         
         output_reward_checkpoint = "/home/hyohyeongjang/2024aut_comprac/weights/reward_model/checkpoint-936",
         output_final = "/home/hyohyeongjang/2024aut_comprac/weights/final_result",
-        num_cores = 4,
+        num_cores = 10,
 
         dataset_normal = "/home/hyohyeongjang/2024aut_comprac/data/data_final/data-normal.pk",
         dataset_rand100 = "/home/hyohyeongjang/2024aut_comprac/data/data_final/data-reward-rand100.pk",
